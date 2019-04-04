@@ -19,7 +19,6 @@ class NonExistantSectionName(PortableExecutableException):
 
 # Struct Classes
 
-
 class DosHeader:
     def __init__(self, content):
         (
@@ -96,6 +95,11 @@ class OptionalHeader32:
 
         self.DataDirectory = list(map(lambda group: DataDirectory(
             bytes(group)), helpers.grouper(data_directories_content, 8)))
+
+
+    def stripDataDirectory(self):
+        #TODO: implement
+        pass
 
     def __str__(self):
         return struct.pack(pe_structs.OPTIONAL_HEADER_32.format,
@@ -201,8 +205,10 @@ class PortableExecutable:
              self.nt_header.FileHeader.NumberOfSections)
         section_headers_data_groups = helpers.grouper(
             content[sections_start_address: sections_end_address], pe_structs.SECTION_HEADER.size)
-        self.sections = list(map(lambda group: SectionHeader(bytes(group)), section_headers_data_groups))
+        self.sections = list(map(lambda group: SectionHeader(
+            bytes(group)), section_headers_data_groups))
 
+    # Sections
     def getSection(self, name):
         for section in self.sections:
             if helpers.decodeBinaryString(section.Name) == name:
@@ -214,3 +220,13 @@ class PortableExecutable:
         section_data_start_address = section.PointerToRawData
         section_data_end_address = section_data_start_address + section.SizeOfRawData
         return self.__content__[section_data_start_address: section_data_end_address]
+
+    def removeSection(self, name):
+        #TODO: implemnt
+    
+    def removeAllSections(self):
+        #TODO: implement
+    
+    def addSection(self, name, data, permissions):
+        #TODO: implement
+        pass
