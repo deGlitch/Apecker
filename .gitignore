@@ -88,7 +88,3 @@ ENV/
 
 # Rope project settings
 .ropeproject
-
-# Custom
-
-test_executables/
