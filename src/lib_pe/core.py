@@ -42,7 +42,7 @@ class DosHeader:
             self.e_lfanew
         ) = struct.unpack(pe_structs.DOS_STRUCT.format, content)
     
-    def pack(self):
+    def pack(self) -> bytes:
         return struct.pack(pe_structs.DOS_STRUCT.format,
             self.e_magic,
             self.e_cblp,
@@ -64,6 +64,53 @@ class DosHeader:
             self.e_res2,
             self.e_lfanew)
 
+class ImportedFunction:
+    def __init__(self, name = None, ordinal = None):
+        self.name = name
+        self.ordinal = ordinal
+
+class ImportedModule:
+    def __init__(self, name, imported_functions = []):
+        self.name = name
+        self.imported_functions = imported_functions
+
+class IMAGE_THUNK_DATA32:
+    def __init__(self, content=None):
+        if content:
+            self.name_address= struct.unpack(pe_structs.IMAGE_THUNK_DATA32.format, content)[0]
+        else:
+            self.name_address = 0
+    def is_empty(self):
+        return self.name_address == 0
+    def is_ordinal(self) -> bool:
+        # check if the first bit of the address is 
+        return bin(self.name_address).split('b')[1][0] == 1
+    
+    def pack(self) ->  bytes:
+        return struct.pack(pe_structs.IMAGE_THUNK_DATA32.format, self.name_address)
+
+class ImageImportDirectory:
+    def __init__(self, content=None):
+        if(content):
+            (
+            self.import_name_list_rva,
+            self.timestamp,
+            self.forwarder_chain,
+            self.module_name_rva,
+            self.import_address_list_rva
+            ) = struct.unpack(pe_structs.IMAGE_IMPORT_DESCRIPTOR.format, content)
+        else:
+            self.import_name_list_rva = 0
+            self.timestamp = 0
+            self.forwarder_chain = 0
+            self.module_name_rva = 0
+            self.import_address_list_rva = 0
+    
+    def is_empty(self):
+        return self.import_name_list_rva == 0 and self.forwarder_chain == 0 and self.module_name_rva == 0 and self.import_address_list_rva == 0
+    def pack(self):
+        return struct.pack(pe_structs.IMAGE_IMPORT_DESCRIPTOR.format, self.import_name_list_rva, self.timestamp, self.forwarder_chain, self.module_name_rva, self.import_address_list_rva)
+        
 class DataDirectory:
     def __init__(self, content):
         (
@@ -71,10 +118,8 @@ class DataDirectory:
             self.Size
         ) = struct.unpack(pe_structs.DATA_DIRECTORY.format, content)
 
-    def pack(self):
-        return struct.pack(pe_structs.DATA_DIRECTORY.format,
-                           self.VirtualAddress,
-                           self.Size)
+    def pack(self) -> bytes:
+        return struct.pack(pe_structs.DATA_DIRECTORY.format, self.VirtualAddress, self.Size)
 
 class OptionalHeader32:
     def __init__(self, content):
@@ -116,10 +161,11 @@ class OptionalHeader32:
             bytes(group)), helpers.grouper(data_directories_content, 8)))
 
     def stripDataDirectory(self):
-        #TODO: implement
-        pass
+        for i in range(0, len(DataDirectory)):
+            self.DataDirectory[i].VirtualAddress = 0
+            self.DataDirectory[i].Size = 0
 
-    def pack(self):
+    def pack(self) -> bytes:
         packed_data_directories = list(map(lambda directory: directory.pack(), self.DataDirectory))
         data_directories_content = reduce(lambda packed_directory1, packed_directory2: packed_directory1 + packed_directory2, packed_data_directories)
         return struct.pack(pe_structs.OPTIONAL_HEADER_32.format,
@@ -154,7 +200,7 @@ class OptionalHeader32:
                            self.LoaderFlags,
                            self.NumberOfRvaAndSizes,
                            data_directories_content)
-
+    
 class FileHeader:
     def __init__(self, content):
         (
@@ -166,7 +212,7 @@ class FileHeader:
             self.SizeOfOptionalHeader,
             self.Characteristics
         ) = struct.unpack(pe_structs.FILE_HEADER.format, content)
-    def pack(self):
+    def pack(self) -> bytes:
         return struct.pack(pe_structs.FILE_HEADER.format,
                            self.Machine,
                            self.NumberOfSections,
@@ -187,7 +233,7 @@ class NtHeader:
         self.FileHeader = FileHeader(file_header_content)
         self.OptionalHeader = OptionalHeader32(optional_header_content)
     
-    def pack(self):
+    def pack(self) -> bytes:
         return struct.pack(pe_structs.NT_HEADER.format, self.Signature, self.FileHeader.pack(), self.OptionalHeader.pack())
 # an abstract section containing the header and the data
 class Section:
@@ -212,8 +258,9 @@ class SectionHeader:
             self.NumberOfLineNumbers,
             self.Characteristics
             ) = struct.unpack(pe_structs.SECTION_HEADER.format, content)
+            self.FormmatedName = self.Name.replace(b'\x00',b'')
 
-    def pack(self):
+    def pack(self) -> bytes:
         return struct.pack(pe_structs.SECTION_HEADER.format, 
             self.Name,
             self.VirtualSize,
@@ -270,22 +317,197 @@ class PortableExecutable:
             # insert the new section at the end of the list
             self.sections.insert(len(self.sections), Section(header, data))
 
+        # Import Data Directory
+        import_data_directory_rva = self.nt_header.OptionalHeader.DataDirectory[1].VirtualAddress
+
+        # get the file address of the import directory by offsetting the raw 
+        # address of the section with the absolute offset created from the rva
+        # find all the import module directory image structs
+        import_directory_images = []
+        import_directory_file_address = self.__convert_rva_to_raw_address(import_data_directory_rva)
+        file_offset = import_directory_file_address
+        while(True):
+            image_import_directory = ImageImportDirectory(content[file_offset : file_offset + pe_structs.IMAGE_IMPORT_DESCRIPTOR.size])
+            if image_import_directory.is_empty():
+                break
+            import_directory_images.append(image_import_directory)
+            file_offset += pe_structs.IMAGE_IMPORT_DESCRIPTOR.size
+        
+        self.imported_modules = []
+        for image in import_directory_images:
+            name_file_address = self.__convert_rva_to_raw_address(image.module_name_rva)
+
+            # get module name
+            name = helpers.read_until_null_byte(content[name_file_address:])
+
+            imported_functions = []
+
+            # get module functions
+            name_list_offset =  self.__convert_rva_to_raw_address(image.import_name_list_rva)
+
+            while(True):
+                thunk_entry = IMAGE_THUNK_DATA32(content[name_list_offset: name_list_offset + pe_structs.IMAGE_THUNK_DATA32.size])
+                if thunk_entry.is_empty():
+                    break
+                
+                #TODO: add usage of ordinals check
+                function_name_struct_file_offset = self.__convert_rva_to_raw_address(thunk_entry.name_address)
+                function_name_file_offset = function_name_struct_file_offset + 2 # there is a HINT(WORD) before the actual name
+                function_name = helpers.read_until_null_byte(content[function_name_file_offset:])
+                imported_functions.append(ImportedFunction(name=function_name))
+
+                name_list_offset += pe_structs.IMAGE_THUNK_DATA32.size
+            
+            self.imported_modules.append(ImportedModule(name, imported_functions))
+
+    def __get_section_by_address(self, address, is_virtual=False):
+        # find the section in which the address of the import directory lies
+        section_of_address = None
+        for section in self.sections:
+            if is_virtual:
+                if address <= section.header.VirtualAddress + section.header.VirtualSize:
+                    section_of_address = section
+                    break
+            else:
+                if address <= section.header.PointerToRawData + section.header.SizeOfRawData:
+                    section_of_address = section
+                    break
+         
+        if section_of_address is None:
+            raise Excpetion("failde to convert rva to raw address")
+        return section
+
+    def __convert_rva_to_raw_address(self, rva):
+        section = self.__get_section_by_address(rva, is_virtual=True)
+        return rva - section.header.VirtualAddress + section.header.PointerToRawData
+
+    def __convert_raw_address_to_rva(self, raw_address):
+        # find the section in which the address of the import directory lies
+        section = self.__get_section_by_address(rva, is_virtual=False)
+        return raw_address - section.header.PointerToRawData + section.header.VirtualAddress
+
+    def __rebuild_import_directory(self):
+
+        # get the section the import directory lies in
+        import_data_directory_rva = self.nt_header.OptionalHeader.DataDirectory[1].VirtualAddress
+        import_data_directory_section = self.__get_section_by_address(import_data_directory_rva, is_virtual=True)
+        import_directory_offset_from_section_start = import_data_directory_rva - import_data_directory_section.header.VirtualAddress
+
+        base_virtual_address = import_data_directory_rva
+        
+        imported_modules_count = len(self.imported_modules)
+        imported_functions_count = sum(map(lambda module: len(module.imported_functions), self.imported_modules))
+
+
+        imported_module_names = []
+        imported_function_names = []
+        for module in self.imported_modules:
+            imported_module_names.append(module.name)
+            for function in module.imported_functions:
+                imported_function_names.append(function.name)
+        
+        # add 1 for the null entries
+        NULL_ENTRY = 1
+        NULL_ENTRIES_PER_MODULE = 1 * imported_modules_count
+        directory_import_tables_overall_size =  (imported_modules_count + NULL_ENTRY) * pe_structs.IMAGE_IMPORT_DESCRIPTOR.size
+        import_lookup_tables_overall_size =  (imported_functions_count + NULL_ENTRIES_PER_MODULE ) * pe_structs.IMAGE_THUNK_DATA32.size
+
+        NULL_BYTE_SIZE = 1
+        HINT_BYTES_SIZE = 2
+
+        function_names_overall_size = sum(map(lambda name: len(name) + NULL_BYTE_SIZE + HINT_BYTES_SIZE, imported_function_names))
+        module_names_overall_size = sum(map(lambda name: len(name) + NULL_BYTE_SIZE, imported_module_names))
+        hint_table_overall_size = function_names_overall_size + module_names_overall_size
+
+        overall_directory_size = directory_import_tables_overall_size + import_lookup_tables_overall_size + hint_table_overall_size
+
+        directory_data = [b'\x00'] * overall_directory_size
+    
+        # start setting the data in the right place
+
+        # hints first
+
+        hints_offset_table = {}
+        hints_offset = directory_import_tables_overall_size + import_lookup_tables_overall_size
+        for name in imported_function_names:
+            hints_offset_table[name] = hints_offset
+            data_to_write = b'\x00\x00' + name + b'\x00' # add the hint to the name and finish it with a null terminator
+            helpers.copy_to_list(hints_offset, data_to_write, directory_data)
+            hints_offset += len(data_to_write)
+
+        for name in imported_module_names:
+            hints_offset_table[name] = hints_offset
+            data_to_write = name + b'\x00' # name and finish it with a null terminator
+            helpers.copy_to_list(hints_offset, data_to_write, directory_data)
+            hints_offset += len(data_to_write)
+
+
+        # thunks
+
+        thunks_start_offset_table = {}
+        thunk_offset = directory_import_tables_overall_size
+        count = 0
+        for module in self.imported_modules:
+            thunks_start_offset_table[module.name] = thunk_offset # save the start of a module thunk array
+            for function in module.imported_functions:
+                count+=1
+                thunk = IMAGE_THUNK_DATA32()
+                thunk.name_address = hints_offset_table[function.name] + base_virtual_address # get the hint offset from the hint offset table
+                helpers.copy_to_list(thunk_offset, thunk.pack(), directory_data)
+                thunk_offset += pe_structs.IMAGE_THUNK_DATA32.size # offset the currant thunk pointer
+            
+            # add the null thunk
+            thunk = IMAGE_THUNK_DATA32()
+            helpers.copy_to_list(thunk_offset, thunk.pack(), directory_data)
+            thunk_offset += pe_structs.IMAGE_THUNK_DATA32.size
+        
+        # modules
+
+        module_offset = 0
+        for module in self.imported_modules:
+            directory = ImageImportDirectory()
+            directory.module_name_rva = hints_offset_table[module.name] + base_virtual_address # update the hint rva with the new offset from the hints offset table
+            directory.import_address_list_rva = thunks_start_offset_table[module.name] + base_virtual_address
+            directory.import_name_list_rva = thunks_start_offset_table[module.name] + base_virtual_address
+
+            # write the directory to the data
+            helpers.copy_to_list(module_offset, directory.pack(), directory_data)
+
+            module_offset += pe_structs.IMAGE_IMPORT_DESCRIPTOR.size
+
+        # update the new section data
+        section_index = self.get_section_index(import_data_directory_section.header.FormmatedName)
+
+        directory_data = import_directory_offset_from_section_start * [b'\x00'] + directory_data
+        self.sections[section_index].data = reduce(lambda byte1,byte2: byte1 + byte2, directory_data)
+
     def get_size(self):
         last_section_header = self.sections[-1].header
         return last_section_header.PointerToRawData + last_section_header.SizeOfRawData
 
     def to_binary_data(self):
+        # rebuild pe directories
+
+        self.__rebuild_import_directory()
+        self.__recalculate_section_addresses()
+
+        ## write data
+
         data = [b'\x00'] * self.get_size()
-        helpers.map_to_list(0, self.dos_header.pack(), data)
-        helpers.map_to_list(self.dos_header.e_lfanew, self.nt_header.pack(), data)
 
+        # dos header
+        helpers.copy_to_list(0, self.dos_header.pack(), data)
+
+        # nt header
+        helpers.copy_to_list(self.dos_header.e_lfanew, self.nt_header.pack(), data)
+
+        # sections
         nt_header_end = self.dos_header.e_lfanew + pe_structs.NT_HEADER.size
-
         for index in range(0, len(self.sections)):
             section_header_start_address = nt_header_end + (index * pe_structs.SECTION_HEADER.size)
             section = self.sections[index]
-            helpers.map_to_list(section_header_start_address, section.header.pack(), data)
-            helpers.map_to_list(section.header.PointerToRawData, section.data, data)
+            helpers.copy_to_list(section_header_start_address, section.header.pack(), data)
+            helpers.copy_to_list(section.header.PointerToRawData, section.data, data)
 
         binary_data = reduce(lambda byte1,byte2: byte1 + byte2, data)
         return binary_data
@@ -300,7 +522,13 @@ class PortableExecutable:
         sections_headers_start_address = self.dos_header.e_lfanew + pe_structs.NT_HEADER.size
         sections_data_start_address = sections_headers_start_address + (pe_structs.SECTION_HEADER.size * self.nt_header.FileHeader.NumberOfSections)
 
+        
+
         for section_index in range(0, len(self.sections)):
+
+            # recalculate section raw size
+            aligned_new_file_size = helpers.alignAddress(len(self.sections[section_index].data), file_alignment)
+            self.sections[section_index].header.SizeOfRawData = aligned_new_file_size
 
             new_unaligned_raw_address = None
             new_unaligned_virtual_address = None
@@ -319,16 +547,23 @@ class PortableExecutable:
             self.sections[section_index].header.PointerToRawData = helpers.alignAddress(new_unaligned_raw_address, file_alignment)
             self.sections[section_index].header.VirtualAddress = helpers.alignAddress(new_unaligned_virtual_address, section_alignment)
 
+    def get_section_index(self, name):
+        for index in range(len(self.sections)):
+            section = self.sections[index]
+            if section.header.FormmatedName == name:
+                return index
+        raise NonExistantSectionName()
+
     def get_section(self, name):
         for section in self.sections:
-            if helpers.decodeBinaryString(section.header.Name) == name:
+            if section.header.FormmatedName == name:
                 return section
         raise NonExistantSectionName()
 
     def remove_section(self, name):
         for index in range(len(self.sections)):
             section = self.sections[index]
-            if(helper.decodeBinaryString(section.header.Name)) == name:
+            if section.header.FormmatedName == name:
                 del self.sections[index]
                 self.nt_header.FileHeader.NumberOfSections -= 1
                 self.__recalculate_section_addresses()
@@ -338,8 +573,9 @@ class PortableExecutable:
     def remove_all_sections(self):
         for index in range(len(self.sections)):
             del self.sections[0]
+        self.nt_header.FileHeader.NumberOfSections = 0
 
-    def add_section(self, name, data, permissions, raw_size = None, virtual_size = None, recalculate_addresses = True):
+    def add_section(self, name, data, permissions, raw_size = None, virtual_size = None):
 
         # calculate the raw size of the new section
         file_alignment = self.nt_header.OptionalHeader.FileAlignment
@@ -369,5 +605,6 @@ class PortableExecutable:
 
         self.nt_header.FileHeader.NumberOfSections += 1
 
-        if recalculate_addresses:
-            self.__recalculate_section_addresses()
+        # recalculate the file addresses
+        self.__recalculate_section_addresses()
+            

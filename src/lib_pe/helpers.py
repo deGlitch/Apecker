@@ -20,12 +20,24 @@ def alignAddress(address, alignment):
     if alignment == 0:
         return address
 
+    if address % alignment == 0:
+        return address
+
     remainder = address % alignment
     distance_from_aligned_address = alignment - remainder
 
     return address + distance_from_aligned_address
 
-def map_to_list(start_address, data, to_be_mapped_list):
+def read_until_null_byte(data):
+    data_read = b''
+    while(True):
+        next_byte = bytes([data[len(data_read)]])
+        if next_byte == b'\x00':
+            break
+        data_read += next_byte
+    return data_read
+
+def copy_to_list(start_address, data, to_be_mapped_list):
     
     if start_address > len(to_be_mapped_list):
         raise ValueError("the start address cannot be bigger then the size of the to be mapped list")
@@ -35,3 +47,15 @@ def map_to_list(start_address, data, to_be_mapped_list):
     
     for index in range(0, len(data)):
         to_be_mapped_list[start_address+index] = bytes([data[index]])
+
+def calculate_entropy(data):
+    bytes_count_list = [0] * 256
+    for byte in data:
+        bytes_count_list[byte] += 1
+    
+    entropy = 0
+    for byte_count in bytes_count_list:
+        avg = byte_count/len(data)
+        if(avg > 0):
+            entropy -= avg * math.log2(avg)
+    return entropy
